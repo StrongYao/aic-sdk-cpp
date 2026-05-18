@@ -201,9 +201,15 @@ int main(int argc, char** argv)
             pcm_buf[i] = static_cast<int16_t>(s);
         }
 
-        wav_write_interleave(wav_out, pcm_buf.data(), frame_bytes);
-
         auto speech_detected = vad.is_speech_detected();
+
+        // If silence, mute the output frame
+        if (!speech_detected)
+        {
+            std::fill(pcm_buf.begin(), pcm_buf.end(), 0);
+        }
+
+        wav_write_interleave(wav_out, pcm_buf.data(), frame_bytes);
 
         // Write vad result as a constant-value frame: 32767 for speech, 0 for silence
         int16_t vad_sample = speech_detected ? 30000 : 0;
@@ -223,6 +229,7 @@ int main(int argc, char** argv)
     std::cout << "Processed " << frames_processed << " frames (" << audio_duration_ms << " ms)\n";
     std::cout << "Total processing time: " << process_duration_ms << " ms\n";
     std::cout << "RTF: " << process_duration_ms / audio_duration_ms << "\n";
+    std::cout << "Speed ratio (1/RTF): " << audio_duration_ms / process_duration_ms << "x\n";
     std::cout << "Output written to: " << output_wav_path << "\n";
 
     return 0;
