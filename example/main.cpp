@@ -10,6 +10,9 @@ int main(int argc, char** argv)
     std::cout << "ai-coustics SDK version: " << aic::get_sdk_version() << "\n";
     std::cout << "Compatible model version: " << aic::get_compatible_model_version() << "\n";
 
+#ifdef AIC_SDK_LICENSE
+    auto license_key = std::string(AIC_SDK_LICENSE);
+#else
     auto license_env = std::getenv("AIC_SDK_LICENSE");
     if (!license_env || std::string(license_env).empty())
     {
@@ -17,8 +20,10 @@ int main(int argc, char** argv)
         return 1;
     }
     auto license_key = std::string(license_env);
+#endif
 
-    auto model_path = std::string();
+    std::string model_path =
+        "/Users/bytedance/Work/aic-sdk-cpp/model/quail_vf_2_1_s_16khz_5i8jb8of_v12.aicmodel";
     if (argc > 1 && argv[1] != nullptr)
     {
         model_path = argv[1];
@@ -118,30 +123,6 @@ int main(int argc, char** argv)
     if (err != aic::ErrorCode::Success)
     {
         std::cerr << "Interleaved processing failed\n";
-        return 1;
-    }
-
-    auto planar_buffers = std::vector<std::vector<float>>(
-        config.num_channels, std::vector<float>(config.num_frames, 0.1f));
-    auto channel_ptrs = std::vector<float*>(config.num_channels);
-    for (uint16_t i = 0; i < config.num_channels; ++i)
-    {
-        channel_ptrs[i] = planar_buffers[i].data();
-    }
-
-    err = processor.process_planar(channel_ptrs.data(), config.num_channels, config.num_frames);
-    if (err != aic::ErrorCode::Success)
-    {
-        std::cerr << "Planar processing failed\n";
-        return 1;
-    }
-
-    auto sequential_buffer = std::vector<float>(config.num_frames * config.num_channels, 0.1f);
-    err = processor.process_sequential(sequential_buffer.data(), config.num_channels,
-                                       config.num_frames);
-    if (err != aic::ErrorCode::Success)
-    {
-        std::cerr << "Sequential processing failed\n";
         return 1;
     }
 
