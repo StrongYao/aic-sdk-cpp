@@ -1,5 +1,8 @@
 #include "aic.hpp"
+#include "audio_wave.h"
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -24,16 +27,12 @@ int main(int argc, char** argv)
 
     std::string model_path =
         "/Users/bytedance/Work/aic-sdk-cpp/model/quail_vf_2_1_s_16khz_5i8jb8of_v12.aicmodel";
-    if (argc > 1 && argv[1] != nullptr)
-    {
-        model_path = argv[1];
-    }
+    std::string input_wav_path  = "/Users/bytedance/Downloads/an_example.wav";
+    std::string output_wav_path = "/Users/bytedance/Downloads/aic_out.wav";
+    std::string vad_wav_path    = "/Users/bytedance/Downloads/aic_vad.wav";
 
-    if (model_path.empty())
-    {
-        std::cerr << "Error: Provide model path as argv[1]: `./my_app <model_path>`\n";
-        return 1;
-    }
+    (void) argc;
+    (void) argv;
 
     auto model_result = aic::Model::create_from_file(model_path);
     auto err          = model_result.error;
@@ -44,11 +43,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto model  = model_result.take();
+    auto model = model_result.take();
 
     // Query optimal settings from the model
     auto sample_rate = model.get_optimal_sample_rate();
-    auto num_frames = model.get_optimal_num_frames(sample_rate);
+    auto num_frames  = model.get_optimal_num_frames(sample_rate);
 
     // Create configuration with optimal settings
     aic::ProcessorConfig config(sample_rate, num_frames);  // mono, fixed frames
@@ -104,11 +103,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto speech_hold_duration = vad.get_parameter(aic::VadParameter::SpeechHoldDuration);
-    auto sensitivity          = vad.get_parameter(aic::VadParameter::Sensitivity);
-    std::cout << "VAD speech hold duration: " << speech_hold_duration << "\n";
-    std::cout << "VAD sensitivity: " << sensitivity << "\n";
-
     err = ctx.set_parameter(aic::ProcessorParameter::EnhancementLevel, 0.8f);
     if (err != aic::ErrorCode::Success)
     {
@@ -116,28 +110,120 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto interleaved_buffer = std::vector<float>(config.num_frames * config.num_channels, 0.1f);
-
-    err = processor.process_interleaved(interleaved_buffer.data(), config.num_channels,
-                                        config.num_frames);
-    if (err != aic::ErrorCode::Success)
+    // Open input wav
+    SWavFile* wav_in = wav_open(input_wav_path.c_str(), "rb");
+    if (!wav_in)
     {
-        std::cerr << "Interleaved processing failed\n";
+        std::cerr << "Failed to open input wav: " << input_wav_path << "\n";
         return 1;
     }
 
-    auto speech_detected = vad.is_speech_detected();
-    std::cout << "Speech detected: " << (speech_detected ? "yes" : "no") << "\n";
-
-    auto enhancement_level = ctx.get_parameter(aic::ProcessorParameter::EnhancementLevel);
-    std::cout << "Enhancement level: " << enhancement_level << "\n";
-
-    err = ctx.reset();
-    if (err != aic::ErrorCode::Success)
+    uint32_t wav_sample_rate = wav_get_sample_rate(wav_in);
+    if (wav_sample_rate != sample_rate)
     {
-        std::cerr << "Reset failed\n";
+        std::cerr << "Warning: input wav sample rate (" << wav_sample_rate
+                  << ") does not match model optimal sample rate (" << sample_rate << ")\n";
+    }
+
+    // Open output wav
+    SWavFile* wav_out = wav_open(output_wav_path.c_str(), "wb");
+    if (!wav_out)
+    {
+        std::cerr << "Failed to open output wav: " << output_wav_path << "\n";
+        wav_close(wav_in);
         return 1;
     }
+    wav_set_format(wav_out, wav_get_format(wav_in));
+    wav_set_sample_rate(wav_out, sample_rate);
+    wav_set_num_channels(wav_out, config.num_channels);
+    wav_set_sample_size(wav_out, 16);
+
+    // Open vad output wav (same format as output wav)
+    SWavFile* wav_vad = wav_open(vad_wav_path.c_str(), "wb");
+    if (!wav_vad)
+    {
+        std::cerr << "Failed to open vad wav: " << vad_wav_path << "\n";
+        wav_close(wav_in);
+        wav_close(wav_out);
+        return 1;
+    }
+    wav_set_format(wav_vad, wav_get_format(wav_in));
+    wav_set_sample_rate(wav_vad, sample_rate);
+    wav_set_num_channels(wav_vad, config.num_channels);
+    wav_set_sample_size(wav_vad, 16);
+
+    // Buffers for int16 <-> float conversion
+    const size_t         frame_samples = config.num_frames * config.num_channels;
+    const size_t         frame_bytes   = frame_samples * sizeof(int16_t);
+    std::vector<int16_t> pcm_buf(frame_samples);
+    std::vector<float>   float_buf(frame_samples);
+
+    int                       frames_processed = 0;
+    std::chrono::microseconds total_process_time(0);
+
+    while (true)
+    {
+        size_t read_bytes = wav_read_interleave(wav_in, pcm_buf.data(), frame_bytes);
+        if (read_bytes < frame_bytes)
+        {
+            break;
+        }
+
+        // Convert int16 -> float [-1.0, 1.0]
+        for (size_t i = 0; i < frame_samples; ++i)
+        {
+            float_buf[i] = pcm_buf[i] / 32768.0f;
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        err =
+            processor.process_interleaved(float_buf.data(), config.num_channels, config.num_frames);
+
+        auto stop = std::chrono::high_resolution_clock::now();
+        total_process_time += std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+
+        if (err != aic::ErrorCode::Success)
+        {
+            std::cerr << "process_interleaved failed at frame " << frames_processed
+                      << ", error: " << static_cast<int>(err) << "\n";
+            break;
+        }
+
+        // Convert float -> int16, clamp to avoid overflow
+        for (size_t i = 0; i < frame_samples; ++i)
+        {
+            float s = float_buf[i] * 32768.0f;
+            if (s > 32767.0f)
+                s = 32767.0f;
+            if (s < -32768.0f)
+                s = -32768.0f;
+            pcm_buf[i] = static_cast<int16_t>(s);
+        }
+
+        wav_write_interleave(wav_out, pcm_buf.data(), frame_bytes);
+
+        auto speech_detected = vad.is_speech_detected();
+
+        // Write vad result as a constant-value frame: 32767 for speech, 0 for silence
+        int16_t vad_sample = speech_detected ? 30000 : 0;
+        std::fill(pcm_buf.begin(), pcm_buf.end(), vad_sample);
+        wav_write_interleave(wav_vad, pcm_buf.data(), frame_bytes);
+
+        ++frames_processed;
+    }
+
+    wav_close(wav_in);
+    wav_close(wav_out);
+    wav_close(wav_vad);
+
+    double audio_duration_ms =
+        static_cast<double>(frames_processed) * num_frames * 1000.0 / sample_rate;
+    double process_duration_ms = total_process_time.count() * 0.001;
+    std::cout << "Processed " << frames_processed << " frames (" << audio_duration_ms << " ms)\n";
+    std::cout << "Total processing time: " << process_duration_ms << " ms\n";
+    std::cout << "RTF: " << process_duration_ms / audio_duration_ms << "\n";
+    std::cout << "Output written to: " << output_wav_path << "\n";
 
     return 0;
 }
